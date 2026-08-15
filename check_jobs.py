@@ -187,40 +187,81 @@ async def fetch_job_cards(locations: list, radius_miles: int = 50, headless: boo
     all_cards = {}
 
     async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless)
-        page = await browser.new_page()
+        # A couple of light "look like a real visitor" touches - a realistic
+        # UK locale/timezone/user-agent, and hiding the navigator.webdriver
+        # flag that marks a browser as automated. Cloud CI runners (like
+        # GitHub Actions) are more likely to get a bot-detection challenge
+        # than a home PC, so this gives the run the best realistic chance.
+        browser = await p.chromium.launch(
+            headless=headless,
+            args=["--disable-blink-features=AutomationControlled"],
+        )
+        context = await browser.new_context(
+            locale="en-GB",
+            timezone_id="Europe/London",
+            viewport={"width": 1366, "height": 850},
+            user_agent=(
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+        )
+        await context.add_init_script(
+            "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+        )
+        page = await context.new_page()
 
-        await page.goto(SEARCH_URL, wait_until="networkidle", timeout=60000)
-        await page.wait_for_timeout(2000)
+        try:
+            await page.goto(SEARCH_URL, wait_until="networkidle", timeout=60000)
+            await page.wait_for_timeout(2000)
 
-        # Dismiss any cookie/consent banner if one shows up.
-        for text in ["Accept all", "I consent", "Accept", "Got it"]:
+            # Dismiss any cookie/consent banner if one shows up.
+            for text in ["Accept all", "I consent", "Accept", "Got it"]:
+                try:
+                    btn = page.get_by_text(text, exact=False).first
+                    if await btn.is_visible(timeout=1000):
+                        await btn.click()
+                        break
+                except Exception:
+                    pass
+
+            # Make sure we're on the "All" jobs tab, not just "Recommended".
             try:
-                btn = page.get_by_text(text, exact=False).first
-                if await btn.is_visible(timeout=1000):
-                    await btn.click()
-                    break
+                all_tab = page.get_by_text("All", exact=True).first
+                await all_tab.click(timeout=5000)
             except Exception:
                 pass
 
-        # Make sure we're on the "All" jobs tab, not just "Recommended".
-        try:
-            all_tab = page.get_by_text("All", exact=True).first
-            await all_tab.click(timeout=5000)
+            await page.wait_for_timeout(1000)
+
+            for location in locations:
+                cards = await _search_one_location(page, location, radius_miles)
+                log(f"  {location}: {len(cards)} job card(s)")
+                for card in cards:
+                    job_id = card.get("jobId")
+                    if job_id and job_id not in all_cards:
+                        all_cards[job_id] = card
         except Exception:
-            pass
-
-        await page.wait_for_timeout(1000)
-
-        for location in locations:
-            cards = await _search_one_location(page, location, radius_miles)
-            log(f"  {location}: {len(cards)} job card(s)")
-            for card in cards:
-                job_id = card.get("jobId")
-                if job_id and job_id not in all_cards:
-                    all_cards[job_id] = card
-
-        await browser.close()
+            # Save what the browser actually saw right before it failed -
+            # this is the only way to tell, after the fact, whether the real
+            # site loaded normally, showed a bot-detection challenge, or
+            # something else entirely. Look for these two files as workflow
+            # artifacts on a failed GitHub Actions run.
+            try:
+                await page.screenshot(
+                    path=str(BASE_DIR / "debug_screenshot.png"), full_page=True
+                )
+                (BASE_DIR / "debug_page.html").write_text(
+                    await page.content(), encoding="utf-8"
+                )
+                log(
+                    f"Saved failure diagnostics (debug_screenshot.png, debug_page.html). "
+                    f"Page title was {await page.title()!r} at {page.url!r}."
+                )
+            except Exception as diag_error:
+                log(f"WARNING: could not save failure diagnostics: {diag_error}")
+            raise
+        finally:
+            await browser.close()
 
     return list(all_cards.values())
 
