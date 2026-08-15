@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import platform
+import re
 import subprocess
 import sys
 import urllib.request
@@ -93,34 +94,41 @@ def save_seen_jobs(job_ids: set):
 
 
 async def _dismiss_overlays(page):
-    """Dismiss the cookie-consent banner and the 'Guided Search' onboarding
-    panel ("Tell us a little more about yourself...") if either is currently
-    covering the page via a modal backdrop. Both can render a second or two
-    after the page otherwise looks ready, so this actively waits for them
-    (wait_for) rather than doing a single instant is_visible() check that
-    can run too early and miss them entirely. Safe to call as many times as
-    needed - it's a no-op if neither overlay is present.
+    """Dismiss whatever pop-up overlay the site currently has open, if any.
+    These can render a second or two after the page otherwise looks ready,
+    so this actively waits for them (wait_for) rather than doing a single
+    instant is_visible() check that can run too early and miss them
+    entirely. Safe to call as many times as needed - it's a no-op if
+    nothing is present.
 
-    IMPORTANT: an earlier version matched the cookie-consent button by
-    searching the page for the text "Accept all" - but the banner's own
-    disclosure paragraph contains the phrase "Select 'Accept all' to
-    consent...", which matched FIRST (it's not a button, just body text),
-    so the click landed on that paragraph and did nothing. The code still
-    reported success and moved on, leaving the modal - and its full-page
-    backdrop - blocking every later click on the real search box. This
-    version targets the actual button elements/attributes instead of
-    freeform page text.
+    The site reuses ONE shared modal component (data-test-id="consentModal")
+    for at least three different pop-ups: the cookie-consent banner, a
+    "Want alerts when jobs are available near you?" signup card, and
+    possibly others - each shown unpredictably. Their close buttons are
+    inconsistently labelled (the job-alert card's close button is literally
+    aria-labelled "Close cookie consent card popup", a copy/paste artifact
+    on the site's own end), so matching by label text is fragile - an
+    earlier version matched the cookie banner by searching for the text
+    "Accept all" and instead matched that phrase inside the banner's own
+    disclosure paragraph, silently clicking on body text and reporting
+    "success" while the modal stayed open and blocked everything.
+
+    What IS consistent across every variant of that shared modal is the
+    small X/cross icon in its corner (data-test-component=
+    "StencilIconCrossLarge"), so that's what this targets first. The
+    separate "Guided Search" onboarding panel ("Tell us a little more about
+    yourself...") is a different component with its own dedicated close
+    button, handled separately below.
     """
     for selector in [
-        '[data-test-id="consentBtn"]',  # the real "Accept all" button
-        'button[aria-label="Continue without accepting cookies"]',
+        'button:has([data-test-component="StencilIconCrossLarge"])',
+        '[data-test-id="consentBtn"]',  # cookie-banner "Accept all" fallback
     ]:
         try:
             btn = page.locator(selector).first
             await btn.wait_for(state="visible", timeout=1500)
             await btn.click()
             await page.wait_for_timeout(300)
-            break
         except Exception:
             pass
 
@@ -221,19 +229,40 @@ async def _search_one_location(page, location: str, radius_miles: int) -> list:
         # and carry on with whatever radius is already selected rather than
         # failing the whole check.
         try:
-            radius_chip = page.get_by_text("miles", exact=False).first
-            await radius_chip.click(timeout=3000)
-            await page.wait_for_timeout(600)
-            dropdown = page.get_by_text("miles", exact=False).first
-            await dropdown.click(timeout=3000)
+            # Step 1: click the "Within N miles" chip in the main filter bar
+            # to open the full "Filters" side panel. This chip has a stable
+            # data-test-id regardless of which radius is currently active.
+            radius_chip = page.locator('[data-test-id="filter-tag-button-distance"]')
+            await radius_chip.wait_for(state="visible", timeout=3000)
+            await radius_chip.click()
+            await page.wait_for_timeout(500)
+
+            # Step 2: inside the panel, click the "Commute distance" dropdown
+            # trigger to open its option list. The trigger itself has no
+            # test-id, but its own text is always exactly "Within N miles"
+            # (the currently active radius) - an earlier version searched
+            # the whole page for any text containing "miles", which could
+            # match unrelated copy elsewhere on the page instead of this
+            # specific control. Scoping to the dialog and anchoring the
+            # pattern to the whole string (^...$) avoids that.
+            filters_dialog = page.get_by_role("dialog")
+            trigger = filters_dialog.get_by_text(re.compile(r"^Within \d+ miles$")).first
+            await trigger.wait_for(state="visible", timeout=3000)
+            await trigger.click()
             await page.wait_for_timeout(400)
-            option = page.get_by_text(f"Within {radius_miles} miles", exact=True).first
-            await option.click(timeout=3000)
+
+            # Step 3: pick the option matching our configured radius from the
+            # now-open listbox.
+            option = filters_dialog.get_by_role("option", name=f"Within {radius_miles} miles")
+            await option.wait_for(state="visible", timeout=3000)
+            await option.click()
             await page.wait_for_timeout(400)
-            apply_btn = page.get_by_text("Show", exact=False).first
+
+            # Step 4: apply - the button's label is dynamic ("Show N result(s)").
+            apply_btn = filters_dialog.get_by_text(re.compile(r"^Show \d+ results?$")).first
             await apply_btn.click(timeout=3000)
-        except Exception:
-            log(f"NOTE: could not set radius to {radius_miles} miles for '{location}' - using the site's current default instead.")
+        except Exception as e:
+            log(f"NOTE: could not set radius to {radius_miles} miles for '{location}' - using the site's current default instead. ({e.__class__.__name__})")
 
         # Give the search results (and our intercepted GraphQL call) time to load.
         await page.wait_for_timeout(3000)
