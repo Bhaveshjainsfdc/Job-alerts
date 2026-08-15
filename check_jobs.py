@@ -95,25 +95,52 @@ def save_seen_jobs(job_ids: set):
 async def _dismiss_overlays(page):
     """Dismiss the cookie-consent banner and the 'Guided Search' onboarding
     panel ("Tell us a little more about yourself...") if either is currently
-    covering the page. Both can render a second or two after the page
-    otherwise looks ready, so this actively waits for them (wait_for) rather
-    than doing a single instant is_visible() check that can run too early
-    and miss them entirely. Safe to call as many times as needed - it's a
-    no-op if neither overlay is present."""
-    for text in ["Accept all", "I consent", "Accept", "Got it"]:
+    covering the page via a modal backdrop. Both can render a second or two
+    after the page otherwise looks ready, so this actively waits for them
+    (wait_for) rather than doing a single instant is_visible() check that
+    can run too early and miss them entirely. Safe to call as many times as
+    needed - it's a no-op if neither overlay is present.
+
+    IMPORTANT: an earlier version matched the cookie-consent button by
+    searching the page for the text "Accept all" - but the banner's own
+    disclosure paragraph contains the phrase "Select 'Accept all' to
+    consent...", which matched FIRST (it's not a button, just body text),
+    so the click landed on that paragraph and did nothing. The code still
+    reported success and moved on, leaving the modal - and its full-page
+    backdrop - blocking every later click on the real search box. This
+    version targets the actual button elements/attributes instead of
+    freeform page text.
+    """
+    for selector in [
+        '[data-test-id="consentBtn"]',  # the real "Accept all" button
+        'button[aria-label="Continue without accepting cookies"]',
+    ]:
         try:
-            btn = page.get_by_text(text, exact=False).first
+            btn = page.locator(selector).first
             await btn.wait_for(state="visible", timeout=1500)
             await btn.click()
             await page.wait_for_timeout(300)
             break
         except Exception:
             pass
+
     try:
         close_guided = page.get_by_role("button", name="Close guided search")
         await close_guided.wait_for(state="visible", timeout=1500)
         await close_guided.click()
         await page.wait_for_timeout(300)
+    except Exception:
+        pass
+
+    # Final safety net: if some other/unrecognised modal backdrop is still
+    # up (a variant we don't have a selector for yet), try Escape - most
+    # accessible dialogs close on it - rather than silently leaving every
+    # subsequent click to fail against an invisible wall.
+    try:
+        backdrop = page.locator('[data-test-component="StencilModalBackdrop"]').first
+        if await backdrop.is_visible():
+            await page.keyboard.press("Escape")
+            await page.wait_for_timeout(300)
     except Exception:
         pass
 
