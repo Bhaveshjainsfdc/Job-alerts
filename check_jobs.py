@@ -68,6 +68,12 @@ def load_config() -> dict:
         val = os.environ.get(env_name)
         if val:
             config[key] = val
+    # JOB_LOCATIONS (comma-separated) overrides the 'locations' list, e.g.
+    # "Swindon,London,Manchester" - not sensitive, but handy for tweaking
+    # the location list without editing config.json in a public repo.
+    locations_env = os.environ.get("JOB_LOCATIONS")
+    if locations_env:
+        config["locations"] = [loc.strip() for loc in locations_env.split(",") if loc.strip()]
     return config
 
 
@@ -86,11 +92,9 @@ def save_seen_jobs(job_ids: set):
         json.dump(sorted(job_ids), f, indent=2)
 
 
-async def fetch_job_cards(location: str, headless: bool = True) -> list:
-    """Drives a real browser against jobsatamazon.co.uk and intercepts the
-    site's own job-search response, rather than guessing at an undocumented
-    API contract. This mirrors what a real visitor's browser does, which is
-    the most reliable way to get past the site's bot-detection layer."""
+async def _search_one_location(page, location: str, radius_miles: int) -> list:
+    """Runs a single location search on an already-open page and returns
+    whatever job cards the site's own search response contains for it."""
 
     captured = {}
 
@@ -110,33 +114,8 @@ async def fetch_job_cards(location: str, headless: bool = True) -> list:
         except Exception as e:
             captured["error"] = str(e)
 
-    async with async_playwright() as p:
-        browser = await p.chromium.launch(headless=headless)
-        page = await browser.new_page()
-        page.on("response", handle_response)
-
-        await page.goto(SEARCH_URL, wait_until="networkidle", timeout=60000)
-        await page.wait_for_timeout(2000)
-
-        # Dismiss any cookie/consent banner if one shows up.
-        for text in ["Accept all", "I consent", "Accept", "Got it"]:
-            try:
-                btn = page.get_by_text(text, exact=False).first
-                if await btn.is_visible(timeout=1000):
-                    await btn.click()
-                    break
-            except Exception:
-                pass
-
-        # Make sure we're on the "All" jobs tab, not just "Recommended".
-        try:
-            all_tab = page.get_by_text("All", exact=True).first
-            await all_tab.click(timeout=5000)
-        except Exception:
-            pass
-
-        await page.wait_for_timeout(1000)
-
+    page.on("response", handle_response)
+    try:
         # Type the location and pick the matching suggestion.
         loc_input = page.get_by_placeholder("Enter postcode or city")
         await loc_input.click()
@@ -162,16 +141,88 @@ async def fetch_job_cards(location: str, headless: bool = True) -> list:
 
         if not clicked:
             log(f"WARNING: could not find a location suggestion matching '{location}'.")
+            return []
+
+        await page.wait_for_timeout(2500)
+
+        # Try to set the commute-distance radius. Best-effort: if the site's
+        # filter panel layout doesn't match what we expect, log a warning
+        # and carry on with whatever radius is already selected rather than
+        # failing the whole check.
+        try:
+            radius_chip = page.get_by_text("miles", exact=False).first
+            await radius_chip.click(timeout=3000)
+            await page.wait_for_timeout(600)
+            dropdown = page.get_by_text("miles", exact=False).first
+            await dropdown.click(timeout=3000)
+            await page.wait_for_timeout(400)
+            option = page.get_by_text(f"Within {radius_miles} miles", exact=True).first
+            await option.click(timeout=3000)
+            await page.wait_for_timeout(400)
+            apply_btn = page.get_by_text("Show", exact=False).first
+            await apply_btn.click(timeout=3000)
+        except Exception:
+            log(f"NOTE: could not set radius to {radius_miles} miles for '{location}' - using the site's current default instead.")
 
         # Give the search results (and our intercepted GraphQL call) time to load.
-        await page.wait_for_timeout(4000)
+        await page.wait_for_timeout(3000)
+    finally:
+        page.remove_listener("response", handle_response)
+
+    if "error" in captured:
+        log(f"WARNING: error parsing job search response for '{location}': {captured['error']}")
+
+    return captured.get("cards", [])
+
+
+async def fetch_job_cards(locations: list, radius_miles: int = 50, headless: bool = True) -> list:
+    """Drives a real browser against jobsatamazon.co.uk and intercepts the
+    site's own job-search response for each configured location, rather
+    than guessing at an undocumented API contract. This mirrors what a real
+    visitor's browser does, which is the most reliable way to get past the
+    site's bot-detection layer. Results from every location are merged and
+    de-duplicated by jobId - the same job can legitimately turn up from more
+    than one search if its radius overlaps with a neighbouring city."""
+
+    all_cards = {}
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=headless)
+        page = await browser.new_page()
+
+        await page.goto(SEARCH_URL, wait_until="networkidle", timeout=60000)
+        await page.wait_for_timeout(2000)
+
+        # Dismiss any cookie/consent banner if one shows up.
+        for text in ["Accept all", "I consent", "Accept", "Got it"]:
+            try:
+                btn = page.get_by_text(text, exact=False).first
+                if await btn.is_visible(timeout=1000):
+                    await btn.click()
+                    break
+            except Exception:
+                pass
+
+        # Make sure we're on the "All" jobs tab, not just "Recommended".
+        try:
+            all_tab = page.get_by_text("All", exact=True).first
+            await all_tab.click(timeout=5000)
+        except Exception:
+            pass
+
+        await page.wait_for_timeout(1000)
+
+        for location in locations:
+            cards = await _search_one_location(page, location, radius_miles)
+            log(f"  {location}: {len(cards)} job card(s)")
+            for card in cards:
+                job_id = card.get("jobId")
+                if job_id and job_id not in all_cards:
+                    all_cards[job_id] = card
 
         await browser.close()
 
-    if "error" in captured:
-        log(f"WARNING: error parsing job search response: {captured['error']}")
-
-    return captured.get("cards", [])
+    return list(all_cards.values())
 
 
 def job_matches_keywords(card: dict, keywords: list) -> bool:
@@ -289,19 +340,30 @@ def trigger_phone_alerts(config: dict, message: str):
         log(f"WARNING: phone call alert failed: {e}")
 
 
+def get_locations(config: dict) -> list:
+    """Supports both the newer 'locations' list (search several cities and
+    merge results - use this for broad/"all jobs" coverage) and the older
+    single 'location' string, for backwards compatibility."""
+    locations = config.get("locations")
+    if locations:
+        return locations
+    single = config.get("location", "")
+    return [single] if single else []
+
+
 async def main():
     config = load_config()
-    location = config.get("location", "")
-    radius = config.get("radius_miles", 30)
+    locations = get_locations(config)
+    radius = config.get("radius_miles", 50)
     keywords = config.get("keywords", [])
     headless = config.get("headless", True)
     alert_on_first_run = config.get("alert_on_first_run", False)
 
-    if not location:
-        log("ERROR: 'location' is not set in config.json.")
+    if not locations:
+        log("ERROR: no 'locations' (or 'location') set in config.json.")
         return
 
-    log(f"Checking jobsatamazon.co.uk for jobs near '{location}' (~{radius} miles)...")
+    log(f"Checking jobsatamazon.co.uk across {len(locations)} location(s) (~{radius} miles each): {', '.join(locations)}")
 
     # Determine "first run" from whether we've ever saved a seen-jobs file
     # before - NOT from whether it's currently empty. If an area genuinely
@@ -313,12 +375,12 @@ async def main():
     seen_ids = load_seen_jobs()
 
     try:
-        cards = await fetch_job_cards(location, headless=headless)
+        cards = await fetch_job_cards(locations, radius_miles=radius, headless=headless)
     except Exception as e:
         log(f"ERROR: failed to fetch job listings: {e}")
         return
 
-    log(f"Fetched {len(cards)} job card(s) from the site.")
+    log(f"Fetched {len(cards)} unique job card(s) across all searched locations.")
 
     matching = [c for c in cards if job_matches_keywords(c, keywords)]
     current_ids = {c["jobId"] for c in matching if c.get("jobId")}
@@ -341,13 +403,17 @@ async def main():
 
     log(f"Found {len(new_cards)} NEW job(s)!")
 
-    lines = [format_job_line(c) for c in new_cards[:3]]
+    # Each line already ends with " - <location>" (see format_job_line), so
+    # with multiple search locations in play, the job's own location is
+    # what tells you where it actually is - not the message as a whole.
+    lines = [format_job_line(c) for c in new_cards[:5]]
     extra = len(new_cards) - len(lines)
     summary = "; ".join(lines)
     if extra > 0:
         summary += f"; and {extra} more"
 
-    message = f"New Amazon warehouse job near {location}: {summary}"
+    plural = "s" if len(new_cards) != 1 else ""
+    message = f"{len(new_cards)} new Amazon warehouse job{plural}: {summary}"
     log(f"Alert message: {message}")
 
     trigger_local_alert(message)
