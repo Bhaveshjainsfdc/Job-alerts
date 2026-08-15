@@ -1,0 +1,14 @@
+{
+  "location": "Swindon",
+  "radius_miles": 30,
+  "keywords": [],
+  "alert_on_first_run": false,
+  "headless": true,
+
+  "ntfy_topic": "amazon-job-alert-e3d1db01e8",
+
+  "twilio_account_sid": "PASTE_YOUR_TWILIO_ACCOUNT_SID_HERE",
+  "twilio_auth_token": "PASTE_YOUR_TWILIO_AUTH_TOKEN_HERE",
+  "twilio_from_number": "+1XXXXXXXXXX",
+  "twilio_to_number": "+44XXXXXXXXXX"
+}

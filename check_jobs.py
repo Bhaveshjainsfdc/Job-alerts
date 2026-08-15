@@ -1,0 +1,359 @@
+"""
+Amazon Warehouse Job Alert - checker
+
+Checks jobsatamazon.co.uk for new warehouse job postings near a given
+location and fires local + phone alerts when a new one appears.
+
+No Amazon login or password is used anywhere in this script - job search
+on jobsatamazon.co.uk is public. You only log in yourself, manually, when
+you're ready to actually apply.
+
+Run this manually first (see README.md) to confirm it works, then let
+setup.ps1 schedule it to run automatically every 10 minutes.
+"""
+
+import asyncio
+import json
+import logging
+import os
+import platform
+import subprocess
+import sys
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+
+from playwright.async_api import async_playwright
+
+BASE_DIR = Path(__file__).resolve().parent
+CONFIG_PATH = BASE_DIR / "config.json"
+SEEN_JOBS_PATH = BASE_DIR / "seen_jobs.json"
+LOG_PATH = BASE_DIR / "job_check.log"
+NOTIFY_SCRIPT = BASE_DIR / "notify_popup.py"
+
+SEARCH_URL = "https://www.jobsatamazon.co.uk/app#/jobSearch"
+
+logging.basicConfig(
+    filename=LOG_PATH,
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+
+
+def log(msg: str):
+    print(msg)
+    logging.info(msg)
+
+
+# When running in GitHub Actions (or any environment where config.json is
+# public/committed to a repo), real credentials should never be written
+# into that file. These environment variables - set from GitHub Actions
+# Secrets - override the matching config.json field when present, so the
+# committed config.json can stay full of harmless placeholders. Locally on
+# your laptop, none of these env vars are set, so config.json is used as-is.
+ENV_OVERRIDES = {
+    "location": "JOB_LOCATION",
+    "ntfy_topic": "NTFY_TOPIC",
+    "twilio_account_sid": "TWILIO_ACCOUNT_SID",
+    "twilio_auth_token": "TWILIO_AUTH_TOKEN",
+    "twilio_from_number": "TWILIO_FROM_NUMBER",
+    "twilio_to_number": "TWILIO_TO_NUMBER",
+}
+
+
+def load_config() -> dict:
+    with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+        config = json.load(f)
+    for key, env_name in ENV_OVERRIDES.items():
+        val = os.environ.get(env_name)
+        if val:
+            config[key] = val
+    return config
+
+
+def load_seen_jobs() -> set:
+    if SEEN_JOBS_PATH.exists():
+        try:
+            with open(SEEN_JOBS_PATH, "r", encoding="utf-8") as f:
+                return set(json.load(f))
+        except Exception:
+            return set()
+    return set()
+
+
+def save_seen_jobs(job_ids: set):
+    with open(SEEN_JOBS_PATH, "w", encoding="utf-8") as f:
+        json.dump(sorted(job_ids), f, indent=2)
+
+
+async def fetch_job_cards(location: str, headless: bool = True) -> list:
+    """Drives a real browser against jobsatamazon.co.uk and intercepts the
+    site's own job-search response, rather than guessing at an undocumented
+    API contract. This mirrors what a real visitor's browser does, which is
+    the most reliable way to get past the site's bot-detection layer."""
+
+    captured = {}
+
+    async def handle_response(response):
+        if response.request.method != "POST" or "graphql" not in response.url:
+            return
+        try:
+            post_data = response.request.post_data
+            if post_data and "searchJobCardsByLocation" in post_data:
+                data = await response.json()
+                cards = (
+                    data.get("data", {})
+                    .get("searchJobCardsByLocation", {})
+                    .get("jobCards", [])
+                )
+                captured["cards"] = cards
+        except Exception as e:
+            captured["error"] = str(e)
+
+    async with async_playwright() as p:
+        browser = await p.chromium.launch(headless=headless)
+        page = await browser.new_page()
+        page.on("response", handle_response)
+
+        await page.goto(SEARCH_URL, wait_until="networkidle", timeout=60000)
+        await page.wait_for_timeout(2000)
+
+        # Dismiss any cookie/consent banner if one shows up.
+        for text in ["Accept all", "I consent", "Accept", "Got it"]:
+            try:
+                btn = page.get_by_text(text, exact=False).first
+                if await btn.is_visible(timeout=1000):
+                    await btn.click()
+                    break
+            except Exception:
+                pass
+
+        # Make sure we're on the "All" jobs tab, not just "Recommended".
+        try:
+            all_tab = page.get_by_text("All", exact=True).first
+            await all_tab.click(timeout=5000)
+        except Exception:
+            pass
+
+        await page.wait_for_timeout(1000)
+
+        # Type the location and pick the matching suggestion.
+        loc_input = page.get_by_placeholder("Enter postcode or city")
+        await loc_input.click()
+        await loc_input.fill(location)
+        await page.wait_for_timeout(1500)
+
+        clicked = False
+        options = page.locator("[role='option'], li")
+        try:
+            count = await options.count()
+        except Exception:
+            count = 0
+        for i in range(count):
+            opt = options.nth(i)
+            try:
+                text = (await opt.inner_text()).strip()
+            except Exception:
+                continue
+            if location.lower() in text.lower() and "current location" not in text.lower():
+                await opt.click()
+                clicked = True
+                break
+
+        if not clicked:
+            log(f"WARNING: could not find a location suggestion matching '{location}'.")
+
+        # Give the search results (and our intercepted GraphQL call) time to load.
+        await page.wait_for_timeout(4000)
+
+        await browser.close()
+
+    if "error" in captured:
+        log(f"WARNING: error parsing job search response: {captured['error']}")
+
+    return captured.get("cards", [])
+
+
+def job_matches_keywords(card: dict, keywords: list) -> bool:
+    if not keywords:
+        return True
+    haystack = " ".join(
+        str(card.get(k, "")) for k in ("jobTitle", "tagLine", "jobType", "employmentType")
+    ).lower()
+    return any(kw.lower() in haystack for kw in keywords)
+
+
+def format_job_line(card: dict) -> str:
+    title = card.get("jobTitle", "Job")
+    loc = card.get("locationName") or card.get("city") or ""
+    pay_min = card.get("totalPayRateMin")
+    pay_max = card.get("totalPayRateMax")
+    currency = card.get("currencyCode", "")
+    pay = f" ({currency}{pay_min}-{pay_max}/hr)" if pay_min and pay_max else ""
+    return f"{title} - {loc}{pay}"
+
+
+def trigger_local_alert(message: str):
+    """Launches a detached popup+sound process so it keeps running (and
+    stays visible) even after this checker script exits. Only makes sense
+    on Windows with a real desktop session - skipped automatically when
+    running in a cloud/headless environment like GitHub Actions."""
+    if platform.system() != "Windows":
+        log("Skipping popup+sound alert (no desktop here - this isn't Windows).")
+        return
+    try:
+        subprocess.Popen(
+            [sys.executable, str(NOTIFY_SCRIPT), message],
+            creationflags=(
+                subprocess.DETACHED_PROCESS | subprocess.CREATE_NEW_PROCESS_GROUP
+            ),
+        )
+    except Exception as e:
+        log(f"WARNING: could not launch popup notifier: {e}")
+
+
+def trigger_ntfy_alert(config: dict, message: str):
+    """Sends a free, instant push notification to your phone via ntfy.sh -
+    no account, no cost, no message-template restrictions. Install the
+    'ntfy' app (Android/iOS) and subscribe to the topic name in config.json
+    to receive these."""
+    topic = config.get("ntfy_topic", "")
+    if not topic or "CHANGE_ME" in topic:
+        log("ntfy not configured yet (config.json still has the placeholder ntfy_topic) - skipping push notification.")
+        return
+
+    url = f"https://ntfy.sh/{topic}"
+    req = urllib.request.Request(
+        url,
+        data=message.encode("utf-8"),
+        method="POST",
+        headers={
+            "Title": "New Amazon Warehouse Job!",
+            "Priority": "urgent",
+            "Tags": "rotating_light",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            if resp.status in (200, 201):
+                log("Sent push notification via ntfy.")
+            else:
+                log(f"WARNING: ntfy push notification returned status {resp.status}.")
+    except Exception as e:
+        log(f"WARNING: ntfy push notification failed: {e}")
+
+
+def trigger_phone_alerts(config: dict, message: str):
+    sid = config.get("twilio_account_sid", "")
+    token = config.get("twilio_auth_token", "")
+    from_number = config.get("twilio_from_number", "")
+    to_number = config.get("twilio_to_number", "")
+
+    if "PASTE_YOUR" in sid or "PASTE_YOUR" in token or "XXXXXXXXXX" in from_number:
+        log("Twilio not configured yet (config.json still has placeholder values) - skipping call/text.")
+        return
+
+    try:
+        from twilio.rest import Client
+    except ImportError:
+        log("WARNING: twilio package not installed - run: pip install -r requirements.txt")
+        return
+
+    client = Client(sid, token)
+
+    # SMS and the call are tried independently - a Twilio trial-account
+    # restriction blocking one (e.g. custom SMS bodies aren't allowed on
+    # trial accounts) should not prevent the other from being attempted.
+    try:
+        client.messages.create(body=message, from_=from_number, to=to_number)
+        log("Sent SMS alert via Twilio.")
+    except Exception as e:
+        code = getattr(e, "code", None)
+        if code == 572006:
+            log(
+                "WARNING: SMS failed - Twilio trial accounts can't send custom "
+                "text message bodies, only a fixed set of template messages. "
+                "Add a small amount of credit to your Twilio account "
+                "(Console -> Upgrade) to unlock custom SMS text. Skipping SMS "
+                "for now; the phone call will still be attempted."
+            )
+        else:
+            log(f"WARNING: SMS alert failed: {e}")
+
+    try:
+        say = message.replace("&", "and")
+        twiml = f'<Response><Say voice="alice">{say}</Say><Pause length="1"/><Say voice="alice">{say}</Say></Response>'
+        client.calls.create(twiml=twiml, from_=from_number, to=to_number)
+        log("Placed phone call alert via Twilio.")
+    except Exception as e:
+        log(f"WARNING: phone call alert failed: {e}")
+
+
+async def main():
+    config = load_config()
+    location = config.get("location", "")
+    radius = config.get("radius_miles", 30)
+    keywords = config.get("keywords", [])
+    headless = config.get("headless", True)
+    alert_on_first_run = config.get("alert_on_first_run", False)
+
+    if not location:
+        log("ERROR: 'location' is not set in config.json.")
+        return
+
+    log(f"Checking jobsatamazon.co.uk for jobs near '{location}' (~{radius} miles)...")
+
+    # Determine "first run" from whether we've ever saved a seen-jobs file
+    # before - NOT from whether it's currently empty. If an area genuinely
+    # has zero jobs right now, seen_ids will still be an empty set after
+    # this run, and checking len(seen_ids) == 0 would wrongly treat every
+    # future run as "still the first run" - silently swallowing the very
+    # first real job that ever shows up instead of alerting on it.
+    is_first_run = not SEEN_JOBS_PATH.exists()
+    seen_ids = load_seen_jobs()
+
+    try:
+        cards = await fetch_job_cards(location, headless=headless)
+    except Exception as e:
+        log(f"ERROR: failed to fetch job listings: {e}")
+        return
+
+    log(f"Fetched {len(cards)} job card(s) from the site.")
+
+    matching = [c for c in cards if job_matches_keywords(c, keywords)]
+    current_ids = {c["jobId"] for c in matching if c.get("jobId")}
+
+    new_ids = current_ids - seen_ids
+    new_cards = [c for c in matching if c.get("jobId") in new_ids]
+
+    save_seen_jobs(current_ids | seen_ids)
+
+    if is_first_run and not alert_on_first_run:
+        log(
+            f"First run: recorded {len(current_ids)} existing job(s) as the baseline, "
+            f"no alert sent. Future new postings will trigger alerts."
+        )
+        return
+
+    if not new_cards:
+        log("No new jobs since last check.")
+        return
+
+    log(f"Found {len(new_cards)} NEW job(s)!")
+
+    lines = [format_job_line(c) for c in new_cards[:3]]
+    extra = len(new_cards) - len(lines)
+    summary = "; ".join(lines)
+    if extra > 0:
+        summary += f"; and {extra} more"
+
+    message = f"New Amazon warehouse job near {location}: {summary}"
+    log(f"Alert message: {message}")
+
+    trigger_local_alert(message)
+    trigger_ntfy_alert(config, message)
+    trigger_phone_alerts(config, message)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
