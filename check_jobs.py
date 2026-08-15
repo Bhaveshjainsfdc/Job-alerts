@@ -228,6 +228,20 @@ async def fetch_job_cards(locations: list, radius_miles: int = 50, headless: boo
                 except Exception:
                     pass
 
+            # The site sometimes shows a "Tell us a little more about
+            # yourself" onboarding panel ("Guided Search") over the page,
+            # with a semi-transparent backdrop that blocks every click on
+            # the real search box underneath - this is what was causing the
+            # "waiting for locator... subtree intercepts pointer events"
+            # failures. Close it via its own close button if present.
+            try:
+                close_guided = page.get_by_role("button", name="Close guided search")
+                if await close_guided.is_visible(timeout=2000):
+                    await close_guided.click()
+                    await page.wait_for_timeout(500)
+            except Exception:
+                pass
+
             # Make sure we're on the "All" jobs tab, not just "Recommended".
             try:
                 all_tab = page.get_by_text("All", exact=True).first
