@@ -1,16 +1,6 @@
 {
   "locations": [
-    "Swindon",
-    "London",
-    "Bristol",
-    "Birmingham",
-    "Manchester",
-    "Leeds",
-    "Newcastle",
-    "Glasgow",
-    "Edinburgh",
-    "Cardiff",
-    "Norwich"
+    "Swindon"
   ],
   "radius_miles": 50,
   "keywords": [],
