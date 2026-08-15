@@ -2,11 +2,15 @@ name: Check Amazon Warehouse Jobs
 
 on:
   schedule:
+    # Every 10 minutes. GitHub may delay scheduled runs by a few minutes
+    # during busy periods - this is a GitHub limitation, not something we
+    # can control. Edit the "*/10" below to change the interval
+    # (e.g. "*/5" for every 5 minutes).
     - cron: "*/10 * * * *"
-  workflow_dispatch: {}
+  workflow_dispatch: {} # lets you click "Run workflow" in the Actions tab to test on demand
 
 permissions:
-  contents: write
+  contents: write # needed so the workflow can commit seen_jobs.json back to the repo
 
 jobs:
   check:
@@ -34,6 +38,11 @@ jobs:
 
       - name: Check for new jobs
         env:
+          # Set these as repo Secrets (Settings -> Secrets and variables ->
+          # Actions) rather than editing config.json, so nothing sensitive
+          # ends up committed to the repo. NTFY_TOPIC is the important one;
+          # the TWILIO_* ones are optional and only needed if you set up
+          # Twilio call/text later.
           NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
           TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
           TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
@@ -41,10 +50,25 @@ jobs:
           TWILIO_TO_NUMBER: ${{ secrets.TWILIO_TO_NUMBER }}
         run: python check_jobs.py
 
+      - name: Upload failure diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-diagnostics
+          path: |
+            debug_screenshot.png
+            debug_page.html
+          if-no-files-found: ignore
+
       - name: Persist seen-jobs state
+        if: always()
         run: |
           git config user.name "job-alert-bot"
           git config user.email "actions@users.noreply.github.com"
-          git add seen_jobs.json
-          git diff --staged --quiet || git commit -m "Update seen jobs [skip ci]"
-          git push
+          if [ -f seen_jobs.json ]; then
+            git add seen_jobs.json
+            git diff --staged --quiet || git commit -m "Update seen jobs [skip ci]"
+            git push
+          else
+            echo "seen_jobs.json wasn't created this run (the job check likely failed before reaching that point) - nothing to persist."
+          fi

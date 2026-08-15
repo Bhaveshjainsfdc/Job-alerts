@@ -1,0 +1,32 @@
+name: Test Alerts
+
+on:
+  workflow_dispatch: {} # click "Run workflow" in the Actions tab any time to fire a test alert
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install Python packages
+        run: pip install -r requirements.txt
+
+      - name: Send a test alert
+        env:
+          # Popup+sound is automatically skipped here (no desktop on GitHub's
+          # runners) - this tests the ntfy push notification and Twilio
+          # call/text, which is exactly what you'd want to verify works from
+          # outside your home network too.
+          NTFY_TOPIC: ${{ secrets.NTFY_TOPIC }}
+          TWILIO_ACCOUNT_SID: ${{ secrets.TWILIO_ACCOUNT_SID }}
+          TWILIO_AUTH_TOKEN: ${{ secrets.TWILIO_AUTH_TOKEN }}
+          TWILIO_FROM_NUMBER: ${{ secrets.TWILIO_FROM_NUMBER }}
+          TWILIO_TO_NUMBER: ${{ secrets.TWILIO_TO_NUMBER }}
+        run: python test_alerts.py
