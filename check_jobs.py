@@ -116,8 +116,12 @@ async def _search_one_location(page, location: str, radius_miles: int) -> list:
 
     page.on("response", handle_response)
     try:
-        # Type the location and pick the matching suggestion.
-        loc_input = page.get_by_placeholder("Enter postcode or city")
+        # Type the location and pick the matching suggestion. The site
+        # sometimes also renders a second, hidden "Guided Search" input with
+        # the exact same placeholder text - targeting the stable
+        # #zipcode-nav-search id (the main header search box) avoids the
+        # "resolved to 2 elements" ambiguity that causes entirely.
+        loc_input = page.locator("#zipcode-nav-search").first
         await loc_input.click()
         await loc_input.fill(location)
         await page.wait_for_timeout(1500)
