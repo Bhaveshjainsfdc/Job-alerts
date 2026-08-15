@@ -2,7 +2,7 @@
   "locations": [
     "Swindon"
   ],
-  "radius_miles": 50,
+  "radius_miles": 30,
   "keywords": [],
   "alert_on_first_run": false,
   "headless": true,
