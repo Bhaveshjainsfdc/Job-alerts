@@ -92,6 +92,32 @@ def save_seen_jobs(job_ids: set):
         json.dump(sorted(job_ids), f, indent=2)
 
 
+async def _dismiss_overlays(page):
+    """Dismiss the cookie-consent banner and the 'Guided Search' onboarding
+    panel ("Tell us a little more about yourself...") if either is currently
+    covering the page. Both can render a second or two after the page
+    otherwise looks ready, so this actively waits for them (wait_for) rather
+    than doing a single instant is_visible() check that can run too early
+    and miss them entirely. Safe to call as many times as needed - it's a
+    no-op if neither overlay is present."""
+    for text in ["Accept all", "I consent", "Accept", "Got it"]:
+        try:
+            btn = page.get_by_text(text, exact=False).first
+            await btn.wait_for(state="visible", timeout=1500)
+            await btn.click()
+            await page.wait_for_timeout(300)
+            break
+        except Exception:
+            pass
+    try:
+        close_guided = page.get_by_role("button", name="Close guided search")
+        await close_guided.wait_for(state="visible", timeout=1500)
+        await close_guided.click()
+        await page.wait_for_timeout(300)
+    except Exception:
+        pass
+
+
 async def _search_one_location(page, location: str, radius_miles: int) -> list:
     """Runs a single location search on an already-open page and returns
     whatever job cards the site's own search response contains for it."""
@@ -116,13 +142,27 @@ async def _search_one_location(page, location: str, radius_miles: int) -> list:
 
     page.on("response", handle_response)
     try:
+        # Belt-and-braces: the "Guided Search" onboarding panel can appear
+        # at any point (not just right after the initial page load), so
+        # check for it again immediately before touching the search box -
+        # this is the actual point where a late-appearing overlay caused
+        # failures even after dismissing it once earlier.
+        await _dismiss_overlays(page)
+
         # Type the location and pick the matching suggestion. The site
         # sometimes also renders a second, hidden "Guided Search" input with
         # the exact same placeholder text - targeting the stable
         # #zipcode-nav-search id (the main header search box) avoids the
         # "resolved to 2 elements" ambiguity that causes entirely.
         loc_input = page.locator("#zipcode-nav-search").first
-        await loc_input.click()
+        try:
+            await loc_input.click(timeout=8000)
+        except Exception:
+            # One more chance: an overlay may have appeared in the brief
+            # window between the check above and this click. Try clearing
+            # it again and retry the click once with the full timeout.
+            await _dismiss_overlays(page)
+            await loc_input.click()
         await loc_input.fill(location)
         await page.wait_for_timeout(1500)
 
@@ -218,29 +258,13 @@ async def fetch_job_cards(locations: list, radius_miles: int = 50, headless: boo
             await page.goto(SEARCH_URL, wait_until="networkidle", timeout=60000)
             await page.wait_for_timeout(2000)
 
-            # Dismiss any cookie/consent banner if one shows up.
-            for text in ["Accept all", "I consent", "Accept", "Got it"]:
-                try:
-                    btn = page.get_by_text(text, exact=False).first
-                    if await btn.is_visible(timeout=1000):
-                        await btn.click()
-                        break
-                except Exception:
-                    pass
-
-            # The site sometimes shows a "Tell us a little more about
-            # yourself" onboarding panel ("Guided Search") over the page,
-            # with a semi-transparent backdrop that blocks every click on
-            # the real search box underneath - this is what was causing the
-            # "waiting for locator... subtree intercepts pointer events"
-            # failures. Close it via its own close button if present.
-            try:
-                close_guided = page.get_by_role("button", name="Close guided search")
-                if await close_guided.is_visible(timeout=2000):
-                    await close_guided.click()
-                    await page.wait_for_timeout(500)
-            except Exception:
-                pass
+            # Dismiss the cookie-consent banner and/or the "Guided Search"
+            # onboarding panel if either is covering the page. Both can
+            # render with a delay (the Guided Search panel appears tied to
+            # a geolocation check), so this actively waits for them rather
+            # than doing a single instant check that can run too early and
+            # miss them entirely.
+            await _dismiss_overlays(page)
 
             # Make sure we're on the "All" jobs tab, not just "Recommended".
             try:
